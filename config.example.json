@@ -1,0 +1,59 @@
+{
+  "statusline": {
+    "enabled": true,
+    "segments": [
+      "context",
+      "session",
+      "week",
+      "model"
+    ],
+    "style": "percent",
+    "separator": " · ",
+    "colors": true,
+    "labels": {
+      "context": "cntx",
+      "session": "sesn",
+      "week": "wkly"
+    },
+    "thresholds": {
+      "warn": 70,
+      "alert": 90
+    },
+    "bar_width": 8,
+    "bar_chars": "█░",
+    "show_resets": false,
+    "show_context_tokens": false,
+    "hide_below": 0,
+    "refresh_interval_seconds": 0
+  },
+  "estimator": {
+    "enabled": true,
+    "threshold_tokens": 15000,
+    "threshold_on": "query",
+    "chars_per_token": 4.0,
+    "assumed_output_tokens": 2000,
+    "include_file_mentions": true,
+    "max_file_bytes": 2000000,
+    "confirm_window_seconds": 300,
+    "always_show": false,
+    "skip_slash_commands": true,
+    "skip_unattended": true,
+    "bypass_prefix": "",
+    "context_window_tokens": 200000,
+    "show_cost": false,
+    "pricing": {
+      "claude-opus-5": {
+        "input": 5.0,
+        "output": 25.0
+      },
+      "claude-sonnet-5": {
+        "input": 3.0,
+        "output": 15.0
+      },
+      "claude-haiku-4-5": {
+        "input": 1.0,
+        "output": 5.0
+      }
+    }
+  }
+}

@@ -1,0 +1,1186 @@
+#!/usr/bin/env python3
+"""
+Clive (CliveCode) -- a small, config-driven customization suite for Claude Code.
+
+Three things live in this one file:
+
+  clive statusline    reads Claude Code's status-line JSON on stdin, prints one line
+  clive estimate      a UserPromptSubmit hook: sizes a query, can gate it on approval
+  clive <rest>        install / uninstall / config / status / doctor / demo
+
+Why one file with no dependencies: it is the entire program. You can read it
+before you trust it, and installing it is a copy.
+"""
+
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+VERSION = "0.1.0"
+REPO = "cjguarino/clive"
+
+# ---------------------------------------------------------------------------
+# Paths
+#
+# Every path is env-overridable, so a test run can point at a throwaway home
+#   CLIVE_HOME=/tmp/clive-test clive status
+# without touching your real setup. CLAUDE_CONFIG_DIR is Claude Code's own
+# override for ~/.claude; we honor it so Clive lands in the same place.
+# ---------------------------------------------------------------------------
+
+HOME = os.path.expanduser("~")
+CLIVE_HOME = os.environ.get("CLIVE_HOME") or os.path.join(HOME, ".clive")
+CONFIG_PATH = os.environ.get("CLIVE_CONFIG") or os.path.join(CLIVE_HOME, "config.json")
+STATE_DIR = os.path.join(CLIVE_HOME, "state")
+BACKUP_DIR = os.path.join(CLIVE_HOME, "backups")
+CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
+SELF = os.path.realpath(__file__)
+
+# ---------------------------------------------------------------------------
+# Default config
+#
+# This dict is the schema. ~/.clive/config.json is deep-merged on top of it,
+# so a partial, stale, or broken config still yields a working program.
+# Keys are documented in README.md -- keep the two in sync.
+# ---------------------------------------------------------------------------
+
+DEFAULTS = {
+    "statusline": {
+        "enabled": True,
+        # Order here is render order. Known: context, session, week, model,
+        # dir, branch, effort.
+        "segments": ["context", "session", "week", "model"],
+        "style": "percent",            # percent | bar | both
+        "separator": " · ",       # " . "
+        "colors": True,
+        "labels": {
+            "context": "cntx",
+            "session": "sesn",
+            "week": "wkly",
+        },
+        # Percentages at or above these switch color.
+        "thresholds": {"warn": 70, "alert": 90},
+        "bar_width": 8,
+        "bar_chars": "█░",   # filled, empty
+        "show_resets": False,          # append "(2h10m)" until the window resets
+        "show_context_tokens": False,  # append "(84k)" to the context segment
+        "hide_below": 0,               # hide a meter under this percentage
+        "refresh_interval_seconds": 0, # 0 = event-driven only (no timer spawns)
+    },
+    "estimator": {
+        "enabled": True,
+        # Block when the estimate crosses this. Set high to effectively
+        # disable the gate while keeping the numbers.
+        "threshold_tokens": 15000,
+        # What gets compared to the threshold:
+        #   query   = prompt + @files + expected reply  (what you are adding)
+        #   request = the whole next API request, context included
+        "threshold_on": "query",
+        "chars_per_token": 4.0,        # English prose ~4; dense code is lower
+        "assumed_output_tokens": 2000, # we cannot know the reply; assume this
+        "include_file_mentions": True, # size @path mentions too
+        "max_file_bytes": 2000000,
+        "confirm_window_seconds": 300, # how long an approval stays valid
+        "always_show": False,          # note the estimate even when under
+        "skip_slash_commands": True,   # hook runs before expansion; skip "/..."
+        "skip_unattended": True,       # never gate headless (claude -p) runs
+        "bypass_prefix": "",           # e.g. ">>" to always send unchecked
+        "context_window_tokens": 200000,
+        "show_cost": False,            # subscription users: tokens, not dollars
+        "pricing": {                   # USD per million tokens, API list price
+            "claude-opus-5": {"input": 5.0, "output": 25.0},
+            "claude-sonnet-5": {"input": 3.0, "output": 15.0},
+            "claude-haiku-4-5": {"input": 1.0, "output": 5.0},
+        },
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Config loading
+# ---------------------------------------------------------------------------
+
+
+def deep_merge(base, over):
+    """Return base updated by over, recursing into dicts. Inputs untouched."""
+    out = dict(base)
+    for key, value in (over or {}).items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def load_config(strict=False):
+    """Config with defaults filled in.
+
+    strict=True surfaces a broken config (CLI use, where you want to know).
+    strict=False swallows it (runtime use, where a status line must not be
+    the reason your editor shows an error).
+    """
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
+            user = json.load(handle)
+        if not isinstance(user, dict):
+            raise ValueError("config root must be a JSON object")
+        return deep_merge(DEFAULTS, user)
+    except FileNotFoundError:
+        return deep_merge(DEFAULTS, {})
+    except Exception as exc:
+        if strict:
+            warn("config at %s is unusable (%s); using defaults" % (CONFIG_PATH, exc))
+        return deep_merge(DEFAULTS, {})
+
+
+def save_config(config):
+    ensure_dirs()
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(config, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+    os.replace(tmp, CONFIG_PATH)  # atomic: no half-written config, ever
+
+
+def ensure_dirs():
+    for path in (CLIVE_HOME, STATE_DIR, BACKUP_DIR):
+        os.makedirs(path, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+ANSI = {
+    "reset": "\033[0m",
+    "dim": "\033[2m",
+    "green": "\033[32m",
+    "yellow": "\033[33m",
+    "red": "\033[31m",
+    "bold": "\033[1m",
+}
+
+
+def paint(text, color, enabled=True):
+    if not enabled or not color:
+        return text
+    return "%s%s%s" % (ANSI.get(color, ""), text, ANSI["reset"])
+
+
+def warn(message):
+    sys.stderr.write("clive: %s\n" % message)
+
+
+def fmt_tokens(count):
+    """840 -> '840', 18200 -> '18.2k', 1240000 -> '1.24M'."""
+    count = float(count or 0)
+    if count < 1000:
+        return "%d" % int(round(count))
+    if count < 1000000:
+        text = "%.1fk" % (count / 1000.0)
+        return text.replace(".0k", "k")
+    return "%.2fM" % (count / 1000000.0)
+
+
+def fmt_duration(seconds):
+    """Seconds until a reset -> '2h10m' / '18m' / 'now'."""
+    seconds = int(seconds or 0)
+    if seconds <= 0:
+        return "now"
+    minutes_total, _ = divmod(seconds, 60)
+    hours, minutes = divmod(minutes_total, 60)
+    days, hours = divmod(hours, 24)
+    if days:
+        return "%dd%dh" % (days, hours) if hours else "%dd" % days
+    if hours and minutes:
+        return "%dh%02dm" % (hours, minutes)
+    if hours:
+        return "%dh" % hours
+    return "%dm" % max(1, minutes)
+
+
+def read_stdin_json():
+    """Both runtimes are fed JSON on stdin. Empty stdin -> {}."""
+    raw = sys.stdin.read() if not sys.stdin.isatty() else ""
+    if not raw.strip():
+        return {}
+    return json.loads(raw)
+
+
+# ===========================================================================
+# RUNTIME 1: the status line
+#
+# Claude Code runs `clive statusline`, pipes the status-line JSON to stdin,
+# and renders our stdout under the prompt box. Contract:
+#   - one line of output (multi-line gets clipped by the terminal width)
+#   - never fail loudly: on any error we print nothing
+#
+# Fields we read (verified against Claude Code 2.1.x):
+#   context_window.used_percentage      0-100, null before the first response
+#   context_window.total_input_tokens   tokens currently in context
+#   context_window.context_window_size  e.g. 200000
+#   rate_limits.five_hour.{used_percentage,resets_at}   subscribers only
+#   rate_limits.seven_day.{used_percentage,resets_at}   subscribers only
+#   model.display_name, workspace.current_dir, effort.level
+# ===========================================================================
+
+
+def meter_color(percentage, thresholds, colors):
+    """Percent -> color name. Under warn we stay neutral; the status line is
+    already dimmed by Claude Code, so quiet is the correct default state."""
+    if not colors:
+        return None
+    if percentage >= float(thresholds.get("alert", 90)):
+        return "red"
+    if percentage >= float(thresholds.get("warn", 70)):
+        return "yellow"
+    return None
+
+
+def render_bar(percentage, config):
+    chars = str(config.get("bar_chars") or "█░")
+    filled_char = chars[0]
+    empty_char = chars[1] if len(chars) > 1 else " "
+    width = max(1, int(config.get("bar_width") or 8))
+    filled = int(round((max(0.0, min(100.0, percentage)) / 100.0) * width))
+    return filled_char * filled + empty_char * (width - filled)
+
+
+def render_meter(label, percentage, config, suffix=""):
+    """One meter, styled per config: percent / bar / both."""
+    style = str(config.get("style") or "percent")
+    colors = bool(config.get("colors", True))
+    color = meter_color(percentage, config.get("thresholds") or {}, colors)
+    shown = "%d%%" % int(round(percentage))
+    if style == "bar":
+        body = render_bar(percentage, config)
+    elif style == "both":
+        body = "%s %s" % (render_bar(percentage, config), shown)
+    else:
+        body = shown
+    text = "%s %s%s" % (label, body, suffix) if label else "%s%s" % (body, suffix)
+    return paint(text, color, colors)
+
+
+def _reset_suffix(window, config):
+    """' (2h10m)' until this rate-limit window resets, if asked for."""
+    if not config.get("show_resets"):
+        return ""
+    resets_at = window.get("resets_at")
+    if not resets_at:
+        return ""
+    return " (%s)" % fmt_duration(float(resets_at) - time.time())
+
+
+def _context_percentage(payload):
+    """Prefer Claude Code's pre-computed percentage; derive it if absent."""
+    window = payload.get("context_window") or {}
+    percentage = window.get("used_percentage")
+    if percentage is None:
+        size = window.get("context_window_size") or 0
+        used = window.get("total_input_tokens") or 0
+        if not size:
+            return None, window
+        percentage = 100.0 * float(used) / float(size)
+    return float(percentage), window
+
+
+def segment(name, payload, config):
+    """Render one named segment, or None when its data is unavailable.
+
+    Returning None (rather than a zero) is deliberate: no rate_limits block
+    means we do not know your usage, and showing 0% would be a lie.
+    """
+    labels = config.get("labels") or {}
+    limits = payload.get("rate_limits") or {}
+    hide_below = float(config.get("hide_below") or 0)
+
+    if name == "context":
+        percentage, window = _context_percentage(payload)
+        if percentage is None or percentage < hide_below:
+            return None
+        suffix = ""
+        if config.get("show_context_tokens") and window.get("total_input_tokens"):
+            suffix = " (%s)" % fmt_tokens(window["total_input_tokens"])
+        return render_meter(labels.get("context", "cntx"), percentage, config, suffix)
+
+    if name in ("session", "week"):
+        key = "five_hour" if name == "session" else "seven_day"
+        window = limits.get(key) or {}
+        percentage = window.get("used_percentage")
+        if percentage is None or float(percentage) < hide_below:
+            return None
+        label = labels.get(name, "sesn" if name == "session" else "wkly")
+        return render_meter(label, float(percentage), config,
+                            _reset_suffix(window, config))
+
+    if name == "model":
+        return ((payload.get("model") or {}).get("display_name")) or None
+
+    if name == "dir":
+        current = (payload.get("workspace") or {}).get("current_dir") or payload.get("cwd")
+        return os.path.basename(current.rstrip("/")) if current else None
+
+    if name == "effort":
+        return (payload.get("effort") or {}).get("level") or None
+
+    if name == "branch":
+        current = (payload.get("workspace") or {}).get("current_dir") or payload.get("cwd")
+        if not current:
+            return None
+        try:
+            # --no-optional-locks keeps a status line from fighting a
+            # concurrent git command for the index lock.
+            result = subprocess.run(
+                ["git", "--no-optional-locks", "branch", "--show-current"],
+                cwd=current, capture_output=True, text=True, timeout=2,
+            )
+        except Exception:
+            return None
+        return result.stdout.strip() or None
+
+    return None
+
+
+def render_statusline(payload, config):
+    pieces = []
+    for name in config.get("segments") or []:
+        try:
+            piece = segment(name, payload, config)
+        except Exception:
+            piece = None  # one bad segment must not cost you the whole line
+        if piece:
+            pieces.append(piece)
+    return str(config.get("separator") or " · ").join(pieces)
+
+
+def cmd_statusline(argv):
+    """Entry point wired into settings.json. Silent on every failure."""
+    try:
+        config = load_config()["statusline"]
+        if not config.get("enabled", True):
+            return 0
+        payload = read_stdin_json()
+        line = render_statusline(payload, config)
+        if line:
+            sys.stdout.write(line + "\n")
+    except Exception as exc:
+        if os.environ.get("CLIVE_DEBUG"):
+            warn("statusline failed: %r" % (exc,))
+    return 0
+
+
+# ===========================================================================
+# RUNTIME 2: the query estimator / approval gate
+#
+# Wired as a UserPromptSubmit hook, which runs before your prompt is sent.
+# Contract (verified against Claude Code 2.1.x):
+#   stdin  : {"prompt", "session_id", "transcript_path", "cwd", ...}
+#   exit 0 : stdout is injected INTO CLAUDE'S CONTEXT. Never print prose here.
+#            JSON {"systemMessage": ...} shows text to the user instead.
+#   exit 2 : stderr is shown TO THE USER ONLY and the prompt is NOT sent.
+#
+# So: exit 2 + stderr is the gate, and JSON + exit 0 is how we talk to you
+# without putting noise in the conversation.
+# ===========================================================================
+
+MENTION_RE = re.compile(r"(?:^|\s)@([^\s]+)")
+TRANSCRIPT_TAIL_BYTES = 262144  # enough for the last few turns
+
+
+def transcript_context(path):
+    """(tokens_in_context, model_id) from the transcript's last real turn.
+
+    The hook is not given context_window, so we read what the last API
+    response reported: input + cache reads + cache writes is what is
+    actually in the window. Sidechain (subagent) turns are skipped --
+    their usage is not your context.
+    """
+    if not path or not os.path.isfile(path):
+        return 0, None
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as handle:
+            if size > TRANSCRIPT_TAIL_BYTES:
+                handle.seek(size - TRANSCRIPT_TAIL_BYTES)
+                handle.readline()  # discard a partial line
+            lines = handle.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return 0, None
+
+    for line in reversed(lines):
+        line = line.strip()
+        if not line or '"assistant"' not in line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if entry.get("type") != "assistant" or entry.get("isSidechain"):
+            continue
+        message = entry.get("message") or {}
+        usage = message.get("usage") or {}
+        total = (
+            (usage.get("input_tokens") or 0)
+            + (usage.get("cache_read_input_tokens") or 0)
+            + (usage.get("cache_creation_input_tokens") or 0)
+        )
+        if total:
+            model = message.get("model")
+            return int(total), (model if model and not model.startswith("<") else None)
+    return 0, None
+
+
+def mention_tokens(prompt, cwd, config):
+    """Size @path mentions -- usually the reason a 'short' prompt is huge."""
+    if not config.get("include_file_mentions", True):
+        return 0, []
+    chars_per_token = float(config.get("chars_per_token") or 4.0)
+    max_bytes = int(config.get("max_file_bytes") or 2000000)
+    total, listed, seen = 0, [], set()
+    for match in MENTION_RE.finditer(prompt):
+        raw = match.group(1).rstrip(".,;:!?)]}'\"")
+        if not raw or raw in seen:
+            continue
+        seen.add(raw)
+        path = os.path.expanduser(raw)
+        if not os.path.isabs(path):
+            path = os.path.join(cwd or ".", path)
+        if not os.path.isfile(path):
+            continue  # directories and @-agent names are not files; skip
+        try:
+            size = min(os.path.getsize(path), max_bytes)
+        except OSError:
+            continue
+        tokens = int(size / chars_per_token)
+        total += tokens
+        listed.append((raw, tokens))
+    return total, listed
+
+
+def estimate_query(payload, config):
+    """Everything we know about the cost of the prompt about to be sent."""
+    prompt = payload.get("prompt") or ""
+    chars_per_token = float(config.get("chars_per_token") or 4.0)
+    prompt_tokens = int(len(prompt) / chars_per_token)
+    file_tokens, files = mention_tokens(prompt, payload.get("cwd"), config)
+    reply_tokens = int(config.get("assumed_output_tokens") or 0)
+    context_tokens, model = transcript_context(payload.get("transcript_path"))
+
+    query = prompt_tokens + file_tokens + reply_tokens
+    request = context_tokens + prompt_tokens + file_tokens + reply_tokens
+    return {
+        "prompt": prompt_tokens,
+        "files": file_tokens,
+        "file_list": files,
+        "reply": reply_tokens,
+        "context": context_tokens,
+        "query": query,
+        "request": request,
+        "model": model,
+    }
+
+
+def estimate_cost(est, config):
+    """USD at API list price. Off by default: on a subscription you pay in
+    rate-limit percentage, not dollars, and a dollar figure would mislead."""
+    if not config.get("show_cost"):
+        return None
+    pricing = config.get("pricing") or {}
+    rates = pricing.get(est["model"] or "")
+    if not rates:
+        return None
+    input_tokens = est["context"] + est["prompt"] + est["files"]
+    dollars = (input_tokens / 1e6) * float(rates.get("input", 0)) + \
+              (est["reply"] / 1e6) * float(rates.get("output", 0))
+    return dollars
+
+
+def context_percentage(tokens, config):
+    size = int(config.get("context_window_tokens") or 0)
+    if not size or not tokens:
+        return None
+    return 100.0 * tokens / size
+
+
+def breakdown(est, config):
+    """'prompt 1.1k + @files 15.1k + reply ~2.0k' -- only nonzero parts."""
+    bits = ["prompt %s" % fmt_tokens(est["prompt"])]
+    if est["files"]:
+        bits.append("@files %s" % fmt_tokens(est["files"]))
+    if est["reply"]:
+        bits.append("reply ~%s" % fmt_tokens(est["reply"]))
+    return " + ".join(bits)
+
+
+def gate_message(est, config, threshold, gate_value):
+    """The text shown to you on a block. Terse, and it tells you the fix."""
+    lines = []
+    lines.append("Clive  this query ~%s tokens  (%s)"
+                 % (fmt_tokens(gate_value), breakdown(est, config)))
+
+    before = context_percentage(est["context"], config)
+    after = context_percentage(est["request"] - est["reply"], config)
+    if est["context"] and before is not None and after is not None:
+        lines.append("       context %s (%d%%) -> %s (%d%%) after send"
+                     % (fmt_tokens(est["context"]), int(before),
+                        fmt_tokens(est["request"] - est["reply"]), int(after)))
+
+    dollars = estimate_cost(est, config)
+    if dollars:
+        lines.append("       ~$%.2f at list price (%s)" % (dollars, est["model"]))
+
+    for name, tokens in est["file_list"][:4]:
+        lines.append("       @%s  %s" % (name, fmt_tokens(tokens)))
+    if len(est["file_list"]) > 4:
+        lines.append("       ... and %d more files" % (len(est["file_list"]) - 4))
+
+    lines.append("       over your %s threshold -- press up-arrow then Enter "
+                 "to send it anyway" % fmt_tokens(threshold))
+    lines.append("       raise it: clive config --set estimator.threshold_tokens=%d"
+                 % int(gate_value * 1.5))
+    return "\n".join(lines)
+
+
+PENDING_PATH = os.path.join(STATE_DIR, "pending.json")
+PENDING_MAX = 20
+
+
+def prompt_fingerprint(prompt):
+    return hashlib.sha256(prompt.strip().encode("utf-8", "replace")).hexdigest()
+
+
+def _load_pending(window_seconds):
+    """{fingerprint: held_at}, expired entries dropped.
+
+    Deliberately NOT keyed by session_id: a resubmit can land in a new
+    session (resume, a second window, headless), and the fingerprint plus
+    the time window is the whole confirmation. Keying on the session only
+    added ways for a legitimate approval to be missed.
+    """
+    try:
+        with open(PENDING_PATH, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if not isinstance(data, dict):
+            return {}
+    except Exception:
+        return {}
+    cutoff = time.time() - float(window_seconds)
+    return {key: at for key, at in data.items()
+            if isinstance(at, (int, float)) and at >= cutoff}
+
+
+def _save_pending(pending):
+    ensure_dirs()
+    # Keep the newest few; this file is a short-lived scratchpad, not a log.
+    trimmed = dict(sorted(pending.items(), key=lambda kv: kv[1],
+                          reverse=True)[:PENDING_MAX])
+    tmp = PENDING_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(trimmed, handle)
+    os.replace(tmp, PENDING_PATH)
+
+
+def take_approval(fingerprint, window_seconds):
+    """True if this exact prompt was gated recently. One-shot: consumed here."""
+    pending = _load_pending(window_seconds)
+    if fingerprint not in pending:
+        if pending:
+            _save_pending(pending)  # opportunistic prune
+        return False
+    pending.pop(fingerprint, None)
+    _save_pending(pending)
+    return True
+
+
+def hold_for_approval(fingerprint, window_seconds):
+    pending = _load_pending(window_seconds)
+    pending[fingerprint] = time.time()
+    _save_pending(pending)
+
+
+def emit_user_message(text):
+    """Show text to the user without it entering Claude's context."""
+    sys.stdout.write(json.dumps({"systemMessage": text, "suppressOutput": True}) + "\n")
+
+
+def cmd_estimate(argv):
+    try:
+        config = load_config()["estimator"]
+        payload = read_stdin_json()
+        prompt = payload.get("prompt") or ""
+
+        if not config.get("enabled", True) or not prompt.strip():
+            return 0
+        # Never gate what no human can approve (claude -p, CI, background runs).
+        if config.get("skip_unattended", True) and \
+                os.environ.get("CLAUDE_CODE_SESSION_ATTENDED") == "0":
+            return 0
+        # The hook sees "/review" before it expands, so the estimate would be
+        # of the typed text, not the real payload. Skip rather than mislead.
+        if config.get("skip_slash_commands", True) and prompt.lstrip().startswith("/"):
+            return 0
+        bypass = str(config.get("bypass_prefix") or "")
+        if bypass and prompt.lstrip().startswith(bypass):
+            return 0
+
+        est = estimate_query(payload, config)
+        threshold = float(config.get("threshold_tokens") or 0)
+        on_request = str(config.get("threshold_on") or "query") == "request"
+        gate_value = est["request"] if on_request else est["query"]
+
+        if not threshold or gate_value < threshold:
+            if config.get("always_show"):
+                emit_user_message("Clive ~%s tokens (%s)"
+                                  % (fmt_tokens(gate_value), breakdown(est, config)))
+            return 0
+
+        fingerprint = prompt_fingerprint(prompt)
+        window = config.get("confirm_window_seconds") or 300
+        if take_approval(fingerprint, window):
+            emit_user_message("Clive sending ~%s tokens (approved)"
+                              % fmt_tokens(gate_value))
+            return 0
+
+        hold_for_approval(fingerprint, window)
+        sys.stderr.write(gate_message(est, config, threshold, gate_value) + "\n")
+        return 2  # blocks the send; stderr above is shown to the user only
+    except Exception as exc:
+        # Fail open. A bug here must never stop you from talking to Claude.
+        if os.environ.get("CLIVE_DEBUG"):
+            import traceback
+            traceback.print_exc()
+            warn("estimate failed: %r" % (exc,))
+        return 0
+
+
+# ===========================================================================
+# Wiring: editing Claude Code's settings.json
+#
+# Rules this code follows, because it is editing YOUR editor's config:
+#   1. back up before any write          (~/.clive/backups/)
+#   2. write atomically                  (tmp + os.replace)
+#   3. touch only Clive's own keys       (never reformat or prune)
+#   4. refuse to guess                   (unparseable settings -> print a snippet)
+#   5. remember what we replaced         (uninstall restores a prior statusLine)
+# ===========================================================================
+
+SCOPES = ("user", "project", "local")
+
+
+def settings_path(scope, project_dir=None):
+    project_dir = project_dir or os.getcwd()
+    if scope == "user":
+        return os.path.join(CLAUDE_DIR, "settings.json")
+    if scope == "project":
+        return os.path.join(project_dir, ".claude", "settings.json")
+    if scope == "local":
+        return os.path.join(project_dir, ".claude", "settings.local.json")
+    raise ValueError("scope must be one of %s" % ", ".join(SCOPES))
+
+
+def read_settings(path):
+    """(data, error). A missing file is fine; an unparseable one is not."""
+    if not os.path.exists(path):
+        return {}, None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            text = handle.read().strip()
+        return (json.loads(text) if text else {}), None
+    except Exception as exc:
+        return None, str(exc)
+
+
+def write_settings(path, data):
+    ensure_dirs()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(path):
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup = os.path.join(BACKUP_DIR, "%s.%s.bak" % (os.path.basename(path), stamp))
+        shutil.copy2(path, backup)
+    tmp = path + ".clive.tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+    os.replace(tmp, path)
+
+
+def statusline_command():
+    return "%s statusline" % shell_quote(SELF)
+
+
+def estimate_command():
+    return "%s estimate" % shell_quote(SELF)
+
+
+def shell_quote(path):
+    return path if re.match(r"^[A-Za-z0-9_@%+=:,./-]+$", path) else "'%s'" % path.replace("'", "'\\''")
+
+
+def is_clive_command(command):
+    return isinstance(command, str) and "clive" in command and \
+        ("statusline" in command or "estimate" in command)
+
+
+def strip_clive(settings):
+    """Remove Clive's entries. Returns what was found, for reporting."""
+    found = {"statusline": False, "estimator": False}
+
+    current = settings.get("statusLine")
+    if isinstance(current, dict) and is_clive_command(current.get("command")):
+        settings.pop("statusLine")
+        found["statusline"] = True
+
+    hooks = settings.get("hooks") or {}
+    groups = hooks.get("UserPromptSubmit") or []
+    kept_groups = []
+    for group in groups:
+        entries = [h for h in (group.get("hooks") or [])
+                   if not is_clive_command(h.get("command"))]
+        if len(entries) != len(group.get("hooks") or []):
+            found["estimator"] = True
+        if entries:
+            group = dict(group, hooks=entries)
+            kept_groups.append(group)
+        elif not group.get("hooks"):
+            kept_groups.append(group)
+    if groups:
+        if kept_groups:
+            hooks["UserPromptSubmit"] = kept_groups
+        else:
+            hooks.pop("UserPromptSubmit", None)
+        if hooks:
+            settings["hooks"] = hooks
+        else:
+            settings.pop("hooks", None)
+    return found
+
+
+def prior_statusline_path(path):
+    key = hashlib.sha256(path.encode()).hexdigest()[:12]
+    return os.path.join(STATE_DIR, "prior-statusline-%s.json" % key)
+
+
+def cmd_install(argv):
+    scope = arg_value(argv, "--scope", "user")
+    want_statusline = "--no-statusline" not in argv
+    want_estimator = "--no-estimator" not in argv
+    path = settings_path(scope)
+
+    settings, error = read_settings(path)
+    if error:
+        warn("cannot parse %s (%s)" % (path, error))
+        warn("not touching it. add this yourself:")
+        print(json.dumps(clive_settings_block(want_statusline, want_estimator), indent=2))
+        return 1
+
+    # Seed an EMPTY config. Writing a snapshot of DEFAULTS here would freeze
+    # today's defaults into the user's file forever, so later improvements
+    # would never reach anyone who had already installed. The file stays a
+    # short diff against DEFAULTS; `clive config` shows the merged result.
+    if not os.path.exists(CONFIG_PATH):
+        save_config({})
+        print("wrote %s (empty -- every setting is at its default)" % CONFIG_PATH)
+
+    ensure_dirs()
+    existing = settings.get("statusLine")
+    if want_statusline and isinstance(existing, dict) and \
+            not is_clive_command(existing.get("command")):
+        with open(prior_statusline_path(path), "w", encoding="utf-8") as handle:
+            json.dump(existing, handle, indent=2)
+        print("stashed your existing statusLine (restored on uninstall)")
+
+    strip_clive(settings)  # idempotent: re-running install never duplicates
+
+    config = load_config(strict=True)
+    if want_statusline:
+        block = {"type": "command", "command": statusline_command()}
+        interval = int(config["statusline"].get("refresh_interval_seconds") or 0)
+        if interval >= 1:
+            block["refreshInterval"] = interval
+        settings["statusLine"] = block
+    if want_estimator:
+        hooks = settings.setdefault("hooks", {})
+        groups = hooks.setdefault("UserPromptSubmit", [])
+        groups.append({"hooks": [{"type": "command",
+                                  "command": estimate_command(),
+                                  "timeout": 10}]})
+
+    write_settings(path, settings)
+    print("wired Clive into %s" % path)
+    if want_statusline:
+        print("  statusLine      -> %s" % statusline_command())
+    if want_estimator:
+        print("  UserPromptSubmit -> %s" % estimate_command())
+    print("")
+    print("Restart Claude Code (or /exit and reopen) to pick up the status line.")
+    print("Try:  clive demo        preview your status line")
+    print("      clive config      see every setting")
+    return 0
+
+
+def clive_settings_block(want_statusline=True, want_estimator=True):
+    block = {}
+    if want_statusline:
+        block["statusLine"] = {"type": "command", "command": statusline_command()}
+    if want_estimator:
+        block["hooks"] = {"UserPromptSubmit": [
+            {"hooks": [{"type": "command", "command": estimate_command(), "timeout": 10}]}
+        ]}
+    return block
+
+
+def cmd_uninstall(argv):
+    scope = arg_value(argv, "--scope", "user")
+    path = settings_path(scope)
+    settings, error = read_settings(path)
+    if error:
+        warn("cannot parse %s (%s); remove the clive entries by hand" % (path, error))
+        return 1
+
+    found = strip_clive(settings)
+    restored = False
+    prior = prior_statusline_path(path)
+    if found["statusline"] and os.path.exists(prior):
+        try:
+            with open(prior, "r", encoding="utf-8") as handle:
+                settings["statusLine"] = json.load(handle)
+            os.remove(prior)
+            restored = True
+        except Exception:
+            pass
+
+    if not any(found.values()):
+        print("nothing of Clive's found in %s" % path)
+    else:
+        write_settings(path, settings)
+        print("removed Clive from %s" % path)
+        if restored:
+            print("  restored your previous statusLine")
+
+    if "--purge" in argv:
+        shutil.rmtree(CLIVE_HOME, ignore_errors=True)
+        print("deleted %s" % CLIVE_HOME)
+    else:
+        print("config kept at %s (clive uninstall --purge removes it)" % CONFIG_PATH)
+    return 0
+
+
+# ===========================================================================
+# CLI: status / doctor / config / demo
+# ===========================================================================
+
+
+def arg_value(argv, flag, default=None):
+    """--flag value  or  --flag=value"""
+    for index, item in enumerate(argv):
+        if item == flag and index + 1 < len(argv):
+            return argv[index + 1]
+        if item.startswith(flag + "="):
+            return item.split("=", 1)[1]
+    return default
+
+
+def demo_payload():
+    now = time.time()
+    return {
+        "model": {"display_name": "Opus 5"},
+        "workspace": {"current_dir": os.getcwd()},
+        "cwd": os.getcwd(),
+        "effort": {"level": "high"},
+        "context_window": {
+            "used_percentage": 48.0,
+            "total_input_tokens": 96000,
+            "context_window_size": 200000,
+        },
+        "rate_limits": {
+            "five_hour": {"used_percentage": 18.0, "resets_at": now + 7800},
+            "seven_day": {"used_percentage": 92.0, "resets_at": now + 248400},
+        },
+    }
+
+
+def cmd_demo(argv):
+    """Preview the status line against sample data (no session needed)."""
+    config = load_config(strict=True)["statusline"]
+    payload = demo_payload()
+    print("your config:")
+    print("  " + (render_statusline(payload, config) or "(empty)"))
+    print("")
+    print("other styles, same data:")
+    for style in ("percent", "bar", "both"):
+        variant = deep_merge(config, {"style": style})
+        print("  %-8s %s" % (style, render_statusline(payload, variant)))
+    print("")
+    print("thresholds (warn %s / alert %s), context climbing:"
+          % (config["thresholds"].get("warn"), config["thresholds"].get("alert")))
+    for percentage in (10, 55, 75, 95):
+        probe = dict(payload, context_window={"used_percentage": percentage,
+                                              "total_input_tokens": int(2000 * percentage),
+                                              "context_window_size": 200000})
+        print("  %3d%%     %s" % (percentage, render_statusline(probe, deep_merge(
+            config, {"segments": ["context"]}))))
+    return 0
+
+
+def wiring_report():
+    """Where Clive is wired, across all three settings scopes."""
+    rows = []
+    for scope in SCOPES:
+        path = settings_path(scope)
+        settings, error = read_settings(path)
+        if error:
+            rows.append((scope, path, "unparseable", "unparseable"))
+            continue
+        current = (settings or {}).get("statusLine") or {}
+        has_statusline = is_clive_command(current.get("command")) if isinstance(current, dict) else False
+        has_hook = False
+        for group in ((settings or {}).get("hooks") or {}).get("UserPromptSubmit") or []:
+            for entry in group.get("hooks") or []:
+                if is_clive_command(entry.get("command")):
+                    has_hook = True
+        rows.append((scope, path, has_statusline, has_hook))
+    return rows
+
+
+def cmd_status(argv):
+    config = load_config(strict=True)
+    print("clive %s   %s" % (VERSION, SELF))
+    print("config    %s%s" % (CONFIG_PATH,
+                              "" if os.path.exists(CONFIG_PATH) else "  (not created yet)"))
+    print("")
+    statusline = config["statusline"]
+    estimator = config["estimator"]
+    print("meters     %s  segments=%s style=%s" % (
+        "on " if statusline.get("enabled") else "off",
+        ",".join(statusline.get("segments") or []), statusline.get("style")))
+    print("estimator  %s  threshold=%s on=%s reply=%s" % (
+        "on " if estimator.get("enabled") else "off",
+        fmt_tokens(estimator.get("threshold_tokens")),
+        estimator.get("threshold_on"),
+        fmt_tokens(estimator.get("assumed_output_tokens"))))
+    print("")
+    print("wired into settings.json:")
+    for scope, path, has_statusline, has_hook in wiring_report():
+        marks = []
+        if has_statusline is True:
+            marks.append("statusLine")
+        if has_hook is True:
+            marks.append("UserPromptSubmit")
+        if has_statusline == "unparseable":
+            marks.append("FILE UNPARSEABLE")
+        print("  %-8s %-45s %s" % (scope, path, ", ".join(marks) or "-"))
+    print("")
+    print("preview   %s" % (render_statusline(demo_payload(), statusline) or "(empty)"))
+    return 0
+
+
+def cmd_doctor(argv):
+    checks = []
+
+    def check(name, ok, detail=""):
+        checks.append((name, bool(ok), detail))
+
+    check("python >= 3.8", sys.version_info >= (3, 8),
+          "%d.%d" % sys.version_info[:2])
+    check("clive on PATH", bool(shutil.which("clive")),
+          shutil.which("clive") or "add ~/.local/bin to PATH")
+
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, encoding="utf-8") as handle:
+                json.load(handle)
+            check("config parses", True, CONFIG_PATH)
+        except Exception as exc:
+            check("config parses", False, "%s: %s" % (CONFIG_PATH, exc))
+    else:
+        check("config exists", False, "run: clive install")  # noqa: only on miss
+
+    ensure_dirs()
+    check("state dir writable", os.access(STATE_DIR, os.W_OK), STATE_DIR)
+
+    wired_anywhere = False
+    for scope, path, has_statusline, has_hook in wiring_report():
+        if has_statusline == "unparseable":
+            check("settings (%s) parses" % scope, False, path)
+            continue
+        if has_statusline or has_hook:
+            wired_anywhere = True
+    check("wired into settings.json", wired_anywhere,
+          "" if wired_anywhere else "run: clive install")
+
+    try:
+        line = render_statusline(demo_payload(), load_config()["statusline"])
+        check("statusline renders", bool(line), line)
+    except Exception as exc:
+        check("statusline renders", False, repr(exc))
+
+    try:
+        payload = {"prompt": "x" * 400, "cwd": os.getcwd(), "session_id": "doctor"}
+        est = estimate_query(payload, load_config()["estimator"])
+        check("estimator runs", est["prompt"] > 0,
+              "400 chars -> ~%s tokens" % fmt_tokens(est["prompt"]))
+    except Exception as exc:
+        check("estimator runs", False, repr(exc))
+
+    width = max(len(name) for name, _, _ in checks)
+    failures = 0
+    for name, ok, detail in checks:
+        failures += 0 if ok else 1
+        print("%s %-*s %s" % ("ok  " if ok else "FAIL", width, name, detail))
+    print("")
+    print("%d check(s) failed" % failures if failures else "all good")
+    return 1 if failures else 0
+
+
+def set_by_path(config, dotted, raw):
+    """estimator.threshold_tokens=25000 -> typed value in the right nest."""
+    try:
+        value = json.loads(raw)          # numbers, true/false, null, arrays
+    except ValueError:
+        value = raw                      # plain strings
+    keys = dotted.split(".")
+    node = config
+    for key in keys[:-1]:
+        if not isinstance(node.get(key), dict):
+            node[key] = {}
+        node = node[key]
+    node[keys[-1]] = value
+    return value
+
+
+def get_by_path(config, dotted):
+    node = config
+    for key in dotted.split("."):
+        if not isinstance(node, dict) or key not in node:
+            return None
+        node = node[key]
+    return node
+
+
+def cmd_config(argv):
+    if "--path" in argv:
+        print(CONFIG_PATH)
+        return 0
+    if "--defaults" in argv:
+        print(json.dumps(DEFAULTS, indent=2, ensure_ascii=False))
+        return 0
+    if "--reset" in argv:
+        save_config({})
+        print("reset %s -- all overrides dropped, defaults apply" % CONFIG_PATH)
+        return 0
+    if "--edit" in argv:
+        if not os.path.exists(CONFIG_PATH):
+            save_config({})
+        editor = os.environ.get("EDITOR") or "vi"
+        return subprocess.call([editor, CONFIG_PATH])
+
+    key = arg_value(argv, "--get")
+    if key:
+        value = get_by_path(load_config(strict=True), key)
+        print(json.dumps(value) if value is not None else "")
+        return 0
+
+    sets = [item for item in argv if "=" in item and not item.startswith("--")]
+    if "--set" in argv:
+        inline = arg_value(argv, "--set")
+        if inline and "=" in inline and inline not in sets:
+            sets.append(inline)
+    if sets:
+        # Edit the user's own file, not the merged view, so config.json stays
+        # a short diff against DEFAULTS instead of a full dump.
+        try:
+            with open(CONFIG_PATH, encoding="utf-8") as handle:
+                user_config = json.load(handle)
+        except Exception:
+            user_config = {}
+        for item in sets:
+            dotted, raw = item.split("=", 1)
+            if get_by_path(DEFAULTS, dotted) is None and \
+                    dotted.split(".")[0] not in DEFAULTS:
+                warn("unknown setting %r (writing it anyway)" % dotted)
+            value = set_by_path(user_config, dotted, raw)
+            print("%s = %s" % (dotted, json.dumps(value)))
+        save_config(user_config)
+        print("saved %s" % CONFIG_PATH)
+        return 0
+
+    print("# %s" % CONFIG_PATH)
+    print(json.dumps(load_config(strict=True), indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_toggle(argv, enabled):
+    which = (argv[0] if argv and not argv[0].startswith("-") else "all").lower()
+    targets = {"meters": "statusline", "statusline": "statusline",
+               "estimator": "estimator", "estimate": "estimator"}
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as handle:
+            user_config = json.load(handle)
+    except Exception:
+        user_config = {}
+    chosen = ["statusline", "estimator"] if which == "all" else [targets.get(which)]
+    if not chosen or chosen == [None]:
+        warn("say what: meters | estimator | all")
+        return 1
+    for name in chosen:
+        set_by_path(user_config, "%s.enabled" % name, "true" if enabled else "false")
+        print("%s %s" % (name, "enabled" if enabled else "disabled"))
+    save_config(user_config)
+    return 0
+
+
+USAGE = """clive %s -- customization suite for Claude Code  (github.com/%s)
+
+  clive install [--scope user|project|local] [--no-statusline] [--no-estimator]
+  clive uninstall [--scope ...] [--purge]
+  clive status                     what is on, and where it is wired
+  clive doctor                     diagnose a setup that is not working
+  clive demo                       preview the status line with sample data
+  clive config                     print the merged config
+  clive config --set k.k=v         e.g. estimator.threshold_tokens=25000
+  clive config --get k.k | --edit | --defaults | --reset | --path
+  clive on|off meters|estimator|all
+  clive version
+
+run by Claude Code, not by you:
+  clive statusline                 status-line JSON on stdin  -> one line out
+  clive estimate                   UserPromptSubmit hook      -> exit 0 or 2
+""" % (VERSION, REPO)
+
+
+def main(argv):
+    command = argv[1] if len(argv) > 1 else "help"
+    rest = argv[2:]
+    table = {
+        "statusline": cmd_statusline,
+        "estimate": cmd_estimate,
+        "install": cmd_install,
+        "init": cmd_install,
+        "uninstall": cmd_uninstall,
+        "status": cmd_status,
+        "doctor": cmd_doctor,
+        "demo": cmd_demo,
+        "config": cmd_config,
+        "on": lambda a: cmd_toggle(a, True),
+        "off": lambda a: cmd_toggle(a, False),
+        "version": lambda a: (print("clive %s" % VERSION), 0)[1],
+        "--version": lambda a: (print("clive %s" % VERSION), 0)[1],
+    }
+    if command in ("help", "-h", "--help"):
+        print(USAGE)
+        return 0
+    handler = table.get(command)
+    if not handler:
+        warn("unknown command %r" % command)
+        print(USAGE)
+        return 1
+    return handler(rest) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
