@@ -13,6 +13,8 @@ That line sits under your prompt box. Clive adds three things:
 2. **`cntx`** — how full the context window is, out of 100%
 3. **a budget gate** — before a big query is sent, Clive sizes it and asks you to confirm
 
+Plus **conserve mode**, one command that retunes all of it for a thin budget.
+
 ---
 
 ## Install
@@ -106,11 +108,79 @@ clive config --set estimator.always_show=true         # show every estimate
 clive off estimator                                   # meters only
 ```
 
-**The estimate is a heuristic, deliberately.** It is `characters / 4`, plus the real
-byte size of any `@file` you mentioned, plus an assumed reply. It does not call the
+**The estimate is a heuristic, deliberately.** It is `characters / 4`, plus any
+`@file` you mentioned (its bytes, plus the line-number prefix Claude Code puts on
+every line, plus a header), plus an assumed reply. It does not call the
 token-counting API — that would mean a network round trip and credentials on every
-keystroke-submit. Expect it to be within ~10-20%, and tune `chars_per_token` down
-toward `3.5` if you mostly paste dense code.
+submit. Expect it to be within ~10-20%, and tune `chars_per_token` toward `3.5` if
+you mostly paste dense code.
+
+---
+
+---
+
+## Conserve mode
+
+When the weekly window is thin and you still have a week of work:
+
+```sh
+clive mode conserve     # on
+clive mode              # what it is changing right now
+clive mode off          # off, exactly
+```
+
+```
+mode conserve on. it changes:
+  estimator.always_show                      false -> true
+  estimator.nudges                           false -> true
+  estimator.threshold_tokens                 15000 -> 6000
+  statusline.show_context_tokens             false -> true
+  statusline.show_resets                     false -> true
+  statusline.thresholds.alert                90 -> 75
+  statusline.thresholds.warn                 70 -> 50
+```
+
+Meters warn at 50% instead of 70%, every estimate is shown instead of only the
+expensive ones, the gate drops to 6k, and the estimator starts naming the two
+things that actually drain a Pro plan:
+
+```
+Clive ~5.2k tokens (prompt 11 + @files 3.2k + reply ~2k)
+  draws down the weekly window fastest on opus -- /model sonnet handles routine edits
+  context is 71% full and every turn re-sends it -- /clear before switching tasks
+```
+
+**A mode is a named set of overrides applied on top of your config at read
+time** — nothing of yours is rewritten, so `clive mode off` is exact, not a
+best-effort restore. Which means **you can define your own**:
+
+```json
+{
+  "modes": {
+    "friday": {
+      "estimator": { "threshold_tokens": 3000, "nudges": true },
+      "statusline": { "thresholds": { "warn": 35, "alert": 60 } }
+    }
+  },
+  "active_mode": "friday"
+}
+```
+
+`clive mode list` shows what is defined. Modes are config, not code.
+
+### What actually drains a $20 plan
+
+Worth knowing regardless of Clive, roughly in order of impact:
+
+- **Opus on routine work.** `/model sonnet` for edits, tests, and renames; keep
+  Opus for the hard reasoning. This is the single biggest lever.
+- **A long session carried across unrelated tasks.** Every turn re-sends the whole
+  context. `/clear` between tasks is cheaper than any setting.
+- **`@`-ing a large file** when a targeted read would do — that is what the gate is
+  for.
+- **`/effort low`** for mechanical work; `xhigh` is for problems that need it.
+- **Unused MCP servers.** Their tool definitions sit in the cached prefix and get
+  re-billed every time the cache goes cold.
 
 ---
 
@@ -132,6 +202,13 @@ clive config --edit               # $EDITOR
 clive config --defaults           # every key and its default
 clive config --reset
 ```
+
+### top level
+
+| key | default | what it does |
+|---|---|---|
+| `active_mode` | `null` | name of the mode to layer over everything else |
+| `modes` | `conserve` | named override sets. Define your own freely |
 
 ### `statusline`
 
@@ -167,7 +244,10 @@ clive config --reset
 | `skip_slash_commands` | `true` | the hook sees `/cmd` before it expands, so the estimate would be of the typed text |
 | `skip_unattended` | `true` | never gate `claude -p` / CI runs |
 | `bypass_prefix` | `""` | e.g. `">>"` to send a prompt unchecked. Avoid `!` — that is Claude Code's bash prefix |
-| `context_window_tokens` | `200000` | only used for the `->  61%` display |
+| `nudges` | `false` | add advice lines naming a concrete lever (conserve turns this on) |
+| `file_line_overhead_tokens` | `2.0` | per-line cost of the line-number prefix Claude Code adds to an `@file` |
+| `file_header_tokens` | `20` | per-file header cost |
+| `context_window_tokens` | `200000` | fallback only — the status line caches the real window size, and that wins |
 | `show_cost` | `false` | add a USD figure at API list price. Off because on a subscription you pay in limit percentage, not dollars |
 | `pricing` | Opus 5 / Sonnet 5 / Haiku 4.5 | `$/million` used when `show_cost` is on |
 
@@ -182,6 +262,7 @@ clive status      what is on, and where it is wired
 clive doctor      diagnose a setup that is not working
 clive demo        preview the status line
 clive config      see above
+clive mode [conserve|off|list]
 clive on|off meters|estimator|all
 ```
 

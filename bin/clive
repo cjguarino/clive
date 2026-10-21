@@ -21,7 +21,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 REPO = "cjguarino/clive"
 
 # ---------------------------------------------------------------------------
@@ -50,6 +50,26 @@ SELF = os.path.realpath(__file__)
 # ---------------------------------------------------------------------------
 
 DEFAULTS = {
+    # The active mode's overrides are applied ON TOP of your config at load
+    # time -- nothing is rewritten, so switching back is exact. null = none.
+    "active_mode": None,
+    "modes": {
+        # Triage mode for a thin remaining budget: warn earlier, gate harder,
+        # show every estimate, and surface the two biggest wasters (running
+        # Opus on routine work, and a bloated context being re-sent).
+        "conserve": {
+            "statusline": {
+                "thresholds": {"warn": 50, "alert": 75},
+                "show_resets": True,
+                "show_context_tokens": True,
+            },
+            "estimator": {
+                "threshold_tokens": 6000,
+                "always_show": True,
+                "nudges": True,
+            },
+        },
+    },
     "statusline": {
         "enabled": True,
         # Order here is render order. Known: context, session, week, model,
@@ -85,11 +105,20 @@ DEFAULTS = {
         "assumed_output_tokens": 2000, # we cannot know the reply; assume this
         "include_file_mentions": True, # size @path mentions too
         "max_file_bytes": 2000000,
+        # An @file does not arrive as raw bytes: Claude Code prefixes every
+        # line with a number and adds a short header. Counting bytes alone
+        # under-reports, and a gate that under-reports is wrong in the
+        # expensive direction. These two are estimates -- tune them.
+        "file_line_overhead_tokens": 2.0,
+        "file_header_tokens": 20,
         "confirm_window_seconds": 300, # how long an approval stays valid
         "always_show": False,          # note the estimate even when under
+        "nudges": False,               # add advice lines (conserve turns on)
         "skip_slash_commands": True,   # hook runs before expansion; skip "/..."
         "skip_unattended": True,       # never gate headless (claude -p) runs
         "bypass_prefix": "",           # e.g. ">>" to always send unchecked
+        # Fallback only: the status line caches the real window size, and
+        # that wins when available.
         "context_window_tokens": 200000,
         "show_cost": False,            # subscription users: tokens, not dollars
         "pricing": {                   # USD per million tokens, API list price
@@ -128,13 +157,30 @@ def load_config(strict=False):
             user = json.load(handle)
         if not isinstance(user, dict):
             raise ValueError("config root must be a JSON object")
-        return deep_merge(DEFAULTS, user)
     except FileNotFoundError:
-        return deep_merge(DEFAULTS, {})
+        user = {}
     except Exception as exc:
         if strict:
             warn("config at %s is unusable (%s); using defaults" % (CONFIG_PATH, exc))
-        return deep_merge(DEFAULTS, {})
+        user = {}
+    return apply_mode(deep_merge(DEFAULTS, user), strict=strict)
+
+
+def apply_mode(merged, strict=False):
+    """Layer the active mode's overrides over the merged config.
+
+    Done at read time, not by rewriting config.json: your own settings stay
+    exactly as you left them underneath, so leaving a mode is lossless.
+    """
+    name = merged.get("active_mode")
+    if not name:
+        return merged
+    overrides = (merged.get("modes") or {}).get(name)
+    if not isinstance(overrides, dict):
+        if strict:
+            warn("active_mode %r is not defined under modes; ignoring" % name)
+        return merged
+    return deep_merge(merged, overrides)
 
 
 def save_config(config):
@@ -358,6 +404,42 @@ def render_statusline(payload, config):
     return str(config.get("separator") or " · ").join(pieces)
 
 
+WINDOW_CACHE = os.path.join(STATE_DIR, "window.json")
+
+
+def cache_window_size(payload):
+    """Remember the real context window size.
+
+    Only the status line is handed context_window_size; the UserPromptSubmit
+    hook is not. Caching it here is what keeps the hook from assuming 200k
+    and reporting a context that is "108% full".
+    """
+    size = (payload.get("context_window") or {}).get("context_window_size")
+    if not size:
+        return
+    try:
+        if os.path.exists(WINDOW_CACHE):
+            with open(WINDOW_CACHE, encoding="utf-8") as handle:
+                if json.load(handle).get("size") == size:
+                    return  # unchanged: do not write on every render
+        ensure_dirs()
+        tmp = WINDOW_CACHE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump({"size": int(size), "at": time.time()}, handle)
+        os.replace(tmp, WINDOW_CACHE)
+    except Exception:
+        pass  # a cache miss is cosmetic; never let it break the line
+
+
+def cached_window_size():
+    try:
+        with open(WINDOW_CACHE, encoding="utf-8") as handle:
+            size = int(json.load(handle).get("size") or 0)
+        return size if size > 0 else 0
+    except Exception:
+        return 0
+
+
 def cmd_statusline(argv):
     """Entry point wired into settings.json. Silent on every failure."""
     try:
@@ -365,6 +447,7 @@ def cmd_statusline(argv):
         if not config.get("enabled", True):
             return 0
         payload = read_stdin_json()
+        cache_window_size(payload)
         line = render_statusline(payload, config)
         if line:
             sys.stdout.write(line + "\n")
@@ -435,12 +518,31 @@ def transcript_context(path):
     return 0, None
 
 
+def count_lines(path, max_bytes):
+    """Newlines in the first max_bytes. Needed because each line Claude Code
+    sends carries a line-number prefix, which bytes-on-disk does not."""
+    count, read = 0, 0
+    try:
+        with open(path, "rb") as handle:
+            while read < max_bytes:
+                chunk = handle.read(min(65536, max_bytes - read))
+                if not chunk:
+                    break
+                read += len(chunk)
+                count += chunk.count(b"\n")
+    except OSError:
+        return 0
+    return count
+
+
 def mention_tokens(prompt, cwd, config):
     """Size @path mentions -- usually the reason a 'short' prompt is huge."""
     if not config.get("include_file_mentions", True):
         return 0, []
     chars_per_token = float(config.get("chars_per_token") or 4.0)
     max_bytes = int(config.get("max_file_bytes") or 2000000)
+    line_overhead = float(config.get("file_line_overhead_tokens") or 0)
+    header_tokens = float(config.get("file_header_tokens") or 0)
     total, listed, seen = 0, [], set()
     for match in MENTION_RE.finditer(prompt):
         raw = match.group(1).rstrip(".,;:!?)]}'\"")
@@ -456,7 +558,10 @@ def mention_tokens(prompt, cwd, config):
             size = min(os.path.getsize(path), max_bytes)
         except OSError:
             continue
-        tokens = int(size / chars_per_token)
+        # bytes -> tokens, plus the line-number prefix on every line, plus
+        # the file header Claude Code wraps it in.
+        lines = count_lines(path, max_bytes) if line_overhead else 0
+        tokens = int(size / chars_per_token + lines * line_overhead + header_tokens)
         total += tokens
         listed.append((raw, tokens))
     return total, listed
@@ -501,10 +606,16 @@ def estimate_cost(est, config):
 
 
 def context_percentage(tokens, config):
-    size = int(config.get("context_window_tokens") or 0)
+    """Percent of the window in use, or None when we cannot know.
+
+    Prefers the size the status line observed; the config value is only a
+    fallback for a session whose status line has not run yet. Clamped,
+    because a stale cache must not produce "108% full".
+    """
+    size = cached_window_size() or int(config.get("context_window_tokens") or 0)
     if not size or not tokens:
         return None
-    return 100.0 * tokens / size
+    return min(100.0, 100.0 * tokens / size)
 
 
 def breakdown(est, config):
@@ -515,6 +626,22 @@ def breakdown(est, config):
     if est["reply"]:
         bits.append("reply ~%s" % fmt_tokens(est["reply"]))
     return " + ".join(bits)
+
+
+def nudge_lines(est, config):
+    """Advice, only when asked for (conserve mode). Each line has to name a
+    concrete lever -- a nudge you cannot act on is just noise."""
+    if not config.get("nudges"):
+        return []
+    lines = []
+    if "opus" in (est.get("model") or ""):
+        lines.append("draws down the weekly window fastest on opus -- "
+                     "/model sonnet handles routine edits")
+    percentage = context_percentage(est["context"], config)
+    if percentage is not None and percentage >= 60:
+        lines.append("context is %d%% full and every turn re-sends it -- "
+                     "/clear before switching tasks" % percentage)
+    return lines
 
 
 def gate_message(est, config, threshold, gate_value):
@@ -538,6 +665,9 @@ def gate_message(est, config, threshold, gate_value):
         lines.append("       @%s  %s" % (name, fmt_tokens(tokens)))
     if len(est["file_list"]) > 4:
         lines.append("       ... and %d more files" % (len(est["file_list"]) - 4))
+
+    for nudge in nudge_lines(est, config):
+        lines.append("       %s" % nudge)
 
     lines.append("       over your %s threshold -- press up-arrow then Enter "
                  "to send it anyway" % fmt_tokens(threshold))
@@ -635,8 +765,11 @@ def cmd_estimate(argv):
 
         if not threshold or gate_value < threshold:
             if config.get("always_show"):
-                emit_user_message("Clive ~%s tokens (%s)"
-                                  % (fmt_tokens(gate_value), breakdown(est, config)))
+                note = "Clive ~%s tokens (%s)" % (fmt_tokens(gate_value),
+                                                  breakdown(est, config))
+                for nudge in nudge_lines(est, config):
+                    note += "\n  " + nudge
+                emit_user_message(note)
             return 0
 
         fingerprint = prompt_fingerprint(prompt)
@@ -952,6 +1085,8 @@ def cmd_status(argv):
     print("clive %s   %s" % (VERSION, SELF))
     print("config    %s%s" % (CONFIG_PATH,
                               "" if os.path.exists(CONFIG_PATH) else "  (not created yet)"))
+    if config.get("active_mode"):
+        print("mode      %s  (clive mode off to revert)" % config["active_mode"])
     print("")
     statusline = config["statusline"]
     estimator = config["estimator"]
@@ -1002,6 +1137,13 @@ def cmd_doctor(argv):
 
     ensure_dirs()
     check("state dir writable", os.access(STATE_DIR, os.W_OK), STATE_DIR)
+
+    merged = load_config()
+    active = merged.get("active_mode")
+    if active:
+        defined = isinstance((merged.get("modes") or {}).get(active), dict)
+        check("mode %r defined" % active, defined,
+              "active" if defined else "not found under modes -- it is being ignored")
 
     wired_anywhere = False
     for scope, path, has_statusline, has_hook in wiring_report():
@@ -1134,6 +1276,95 @@ def cmd_toggle(argv, enabled):
     return 0
 
 
+def flatten(node, prefix=""):
+    """{'estimator': {'nudges': True}} -> {'estimator.nudges': True}"""
+    out = {}
+    for key, value in (node or {}).items():
+        path = "%s.%s" % (prefix, key) if prefix else key
+        if isinstance(value, dict):
+            out.update(flatten(value, path))
+        else:
+            out[path] = value
+    return out
+
+
+def mode_diff(config, name):
+    """[(key, from, to)] for what mode `name` changes. Shown before you flip
+    it, so a mode is never a black box."""
+    overrides = (config.get("modes") or {}).get(name) or {}
+    base = flatten({k: v for k, v in config.items() if k != "modes"})
+    after = flatten(deep_merge({k: v for k, v in config.items() if k != "modes"},
+                               overrides))
+    rows = []
+    for key in sorted(after):
+        if base.get(key) != after[key]:
+            rows.append((key, base.get(key), after[key]))
+    return rows
+
+
+def user_config_raw():
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def cmd_mode(argv):
+    config = load_config(strict=True)
+    available = sorted((config.get("modes") or {}).keys())
+    active = config.get("active_mode")
+    target = argv[0] if argv and not argv[0].startswith("-") else None
+
+    if target in ("list", "ls"):
+        for name in available:
+            print("%s %s" % ("*" if name == active else " ", name))
+        return 0
+
+    if target is None:
+        print("active mode: %s" % (active or "none"))
+        print("available  : %s" % (", ".join(available) or "none"))
+        if active:
+            print("")
+            print("%s changes:" % active)
+            # Against the un-moded baseline, so this reads as "what the mode
+            # is doing to me right now".
+            baseline = apply_mode(deep_merge(DEFAULTS, user_config_raw()))
+            baseline = dict(baseline, active_mode=None)
+            for key, was, now in mode_diff(baseline, active):
+                print("  %-42s %s -> %s" % (key, json.dumps(was), json.dumps(now)))
+        else:
+            print("")
+            print("try: clive mode conserve")
+        return 0
+
+    if target in ("off", "none", "normal", "clear"):
+        user = user_config_raw()
+        user.pop("active_mode", None)
+        save_config(user)
+        print("mode off -- your own settings apply again, unchanged")
+        return 0
+
+    if target not in available:
+        warn("no mode %r. available: %s" % (target, ", ".join(available) or "none"))
+        warn("define one under \"modes\" in %s" % CONFIG_PATH)
+        return 1
+
+    rows = mode_diff(dict(config, active_mode=None), target)
+    user = user_config_raw()
+    user["active_mode"] = target
+    save_config(user)
+    print("mode %s on. it changes:" % target)
+    for key, was, now in rows:
+        print("  %-42s %s -> %s" % (key, json.dumps(was), json.dumps(now)))
+    print("")
+    print("your own settings are untouched underneath -- clive mode off reverts")
+    if any(key.endswith("refresh_interval_seconds") for key, _, _ in rows):
+        print("note: refresh_interval_seconds only takes effect after clive install")
+    return 0
+
+
 USAGE = """clive %s -- customization suite for Claude Code  (github.com/%s)
 
   clive install [--scope user|project|local] [--no-statusline] [--no-estimator]
@@ -1144,6 +1375,7 @@ USAGE = """clive %s -- customization suite for Claude Code  (github.com/%s)
   clive config                     print the merged config
   clive config --set k.k=v         e.g. estimator.threshold_tokens=25000
   clive config --get k.k | --edit | --defaults | --reset | --path
+  clive mode [conserve|off|list]   apply a named set of overrides
   clive on|off meters|estimator|all
   clive version
 
@@ -1166,6 +1398,7 @@ def main(argv):
         "doctor": cmd_doctor,
         "demo": cmd_demo,
         "config": cmd_config,
+        "mode": cmd_mode,
         "on": lambda a: cmd_toggle(a, True),
         "off": lambda a: cmd_toggle(a, False),
         "version": lambda a: (print("clive %s" % VERSION), 0)[1],

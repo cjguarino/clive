@@ -1,4 +1,22 @@
 {
+  "active_mode": null,
+  "modes": {
+    "conserve": {
+      "statusline": {
+        "thresholds": {
+          "warn": 50,
+          "alert": 75
+        },
+        "show_resets": true,
+        "show_context_tokens": true
+      },
+      "estimator": {
+        "threshold_tokens": 6000,
+        "always_show": true,
+        "nudges": true
+      }
+    }
+  },
   "statusline": {
     "enabled": true,
     "segments": [
@@ -34,8 +52,11 @@
     "assumed_output_tokens": 2000,
     "include_file_mentions": true,
     "max_file_bytes": 2000000,
+    "file_line_overhead_tokens": 2.0,
+    "file_header_tokens": 20,
     "confirm_window_seconds": 300,
     "always_show": false,
+    "nudges": false,
     "skip_slash_commands": true,
     "skip_unattended": true,
     "bypass_prefix": "",
